@@ -18,6 +18,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Standard asyncHandler wrapper for route handlers
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
 // Ensure directories exist
 const dataDir = path.join(__dirname, "data");
 const uploadsDir = path.join(__dirname, "uploads");
@@ -35,10 +40,11 @@ if (!fs.existsSync(dbPath)) {
 
 function getStoredImages() {
   try {
+    if (!fs.existsSync(dbPath)) return [];
     const raw = fs.readFileSync(dbPath, "utf-8");
     return JSON.parse(raw) || [];
   } catch (err) {
-    console.error("Error reading images db:", err);
+    console.error("Error reading images DB:", err.message);
     return [];
   }
 }
@@ -47,7 +53,7 @@ function saveStoredImages(images) {
   try {
     fs.writeFileSync(dbPath, JSON.stringify(images, null, 2), "utf-8");
   } catch (err) {
-    console.error("Error writing images db:", err);
+    console.error("Error writing images DB:", err.message);
   }
 }
 
@@ -111,11 +117,12 @@ export async function syncLocalImagesToCloudinary() {
       img.format = cloudResult.format;
       img.bytes = cloudResult.bytes;
 
-      // Clean up local file after successful Cloudinary upload
-      try {
-        fs.unlinkSync(filePath);
-      } catch (e) {
-        console.warn("Could not remove synced local file:", e.message);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {
+          console.warn("Could not remove synced local file:", e.message);
+        }
       }
       delete img.localPath;
       synced++;
@@ -133,45 +140,52 @@ export async function syncLocalImagesToCloudinary() {
 }
 
 // Update Cloudinary config dynamically & auto-sync pending local images
-app.post("/api/config", async (req, res) => {
-  const { cloud_name, api_key, api_secret } = req.body;
-  const newStatus = saveConfig({ cloud_name, api_key, api_secret });
-  let syncResult = null;
-  if (newStatus.configured) {
-    syncResult = await syncLocalImagesToCloudinary();
-  }
-  res.json({
-    success: true,
-    message: newStatus.configured
-      ? "Cloudinary successfully configured!"
-      : "Configuration saved, but some credentials are still missing.",
-    config: newStatus,
-    synced: syncResult,
-  });
-});
+app.post(
+  "/api/config",
+  asyncHandler(async (req, res) => {
+    const { cloud_name, api_key, api_secret } = req.body;
+    const newStatus = saveConfig({ cloud_name, api_key, api_secret });
+    let syncResult = null;
+    if (newStatus.configured) {
+      syncResult = await syncLocalImagesToCloudinary();
+    }
+    res.json({
+      success: true,
+      message: newStatus.configured
+        ? "Cloudinary successfully configured!"
+        : "Configuration saved, but some credentials are still missing.",
+      config: newStatus,
+      synced: syncResult,
+    });
+  })
+);
 
-// Explicit endpoint to trigger sync of local fallback images to Cloudinary
-app.post("/api/images/sync", async (req, res) => {
-  try {
+// Trigger sync of local fallback images to Cloudinary
+app.post(
+  "/api/images/sync",
+  asyncHandler(async (req, res) => {
     const result = await syncLocalImagesToCloudinary();
     res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+  })
+);
 
 // Get all stored gallery images
-app.get("/api/images", (req, res) => {
-  const images = getStoredImages();
-  res.json({
-    success: true,
-    images,
-  });
-});
+app.get(
+  "/api/images",
+  asyncHandler(async (req, res) => {
+    const images = getStoredImages();
+    res.json({
+      success: true,
+      images,
+    });
+  })
+);
 
-// Upload image(s) to Cloudinary (or local fallback if credentials pending)
-app.post("/api/images/upload", upload.array("images", 10), async (req, res) => {
-  try {
+// Upload image(s) to Cloudinary
+app.post(
+  "/api/images/upload",
+  upload.array("images", 20),
+  asyncHandler(async (req, res) => {
     const files = req.files || [];
     if (!files.length) {
       return res.status(400).json({ error: "No image files provided" });
@@ -185,25 +199,44 @@ app.post("/api/images/upload", upload.array("images", 10), async (req, res) => {
       const originalName = file.originalname || "Pasted image";
 
       if (isConfigured) {
-        // Upload directly to Cloudinary
-        const cloudResult = await uploadToCloudinary(
-          file.buffer,
-          originalName,
-          file.mimetype
-        );
+        try {
+          const cloudResult = await uploadToCloudinary(
+            file.buffer,
+            originalName,
+            file.mimetype
+          );
 
-        const newImage = {
-          id: imageId,
-          name: originalName,
-          url: cloudResult.secure_url || cloudResult.url,
-          public_id: cloudResult.public_id,
-          format: cloudResult.format,
-          bytes: cloudResult.bytes,
-          storage: "cloudinary",
-          createdAt: new Date().toISOString(),
-        };
+          uploadedImages.push({
+            id: imageId,
+            name: originalName,
+            url: cloudResult.secure_url || cloudResult.url,
+            public_id: cloudResult.public_id,
+            format: cloudResult.format,
+            bytes: cloudResult.bytes,
+            storage: "cloudinary",
+            createdAt: new Date().toISOString(),
+          });
+        } catch (uploadErr) {
+          console.error(`Failed to upload ${originalName} to Cloudinary:`, uploadErr.message);
 
-        uploadedImages.push(newImage);
+          // Graceful fallback to local storage for this specific image
+          const ext = path.extname(originalName) || ".png";
+          const localFileName = `${imageId}${ext}`;
+          const filePath = path.join(uploadsDir, localFileName);
+          fs.writeFileSync(filePath, file.buffer);
+
+          const localUrl = `http://localhost:${PORT}/uploads/${localFileName}`;
+          uploadedImages.push({
+            id: imageId,
+            name: originalName,
+            url: localUrl,
+            public_id: null,
+            localPath: localFileName,
+            storage: "local_pending_cloudinary",
+            bytes: file.size,
+            createdAt: new Date().toISOString(),
+          });
+        }
       } else {
         // Fallback: save to local uploads directory
         const ext = path.extname(originalName) || ".png";
@@ -211,11 +244,8 @@ app.post("/api/images/upload", upload.array("images", 10), async (req, res) => {
         const filePath = path.join(uploadsDir, localFileName);
         fs.writeFileSync(filePath, file.buffer);
 
-        const host = req.get("host");
-        const protocol = req.protocol;
-        const localUrl = `${protocol}://${host}/uploads/${localFileName}`;
-
-        const newImage = {
+        const localUrl = `http://localhost:${PORT}/uploads/${localFileName}`;
+        uploadedImages.push({
           id: imageId,
           name: originalName,
           url: localUrl,
@@ -224,36 +254,79 @@ app.post("/api/images/upload", upload.array("images", 10), async (req, res) => {
           storage: "local_pending_cloudinary",
           bytes: file.size,
           createdAt: new Date().toISOString(),
-        };
-
-        uploadedImages.push(newImage);
+        });
       }
     }
 
-    // Persist to JSON DB
-    const currentList = getStoredImages();
-    const updatedList = [...uploadedImages, ...currentList];
-    saveStoredImages(updatedList);
+    if (uploadedImages.length) {
+      const currentList = getStoredImages();
+      saveStoredImages([...uploadedImages, ...currentList]);
+    }
 
     return res.json({
       success: true,
       cloudinaryConfigured: isConfigured,
       images: uploadedImages,
-      warning: !isConfigured
-        ? "Images stored locally. Cloudinary Cloud Name and API Secret are required to upload directly to Cloudinary."
-        : null,
     });
-  } catch (error) {
-    console.error("Upload error:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to upload image",
-    });
-  }
-});
+  })
+);
 
-// Delete image from Cloudinary and DB
-app.delete("/api/images/:id", async (req, res) => {
-  try {
+// Helper to delete an image safely (best-effort deletion so one failure never blocks a batch)
+async function removeImageFromStorageAndDb(target) {
+  if (target.public_id && isCloudinaryConfigured()) {
+    try {
+      await deleteFromCloudinary(target.public_id);
+    } catch (err) {
+      console.warn(`Cloudinary delete warning for ${target.public_id}:`, err.message);
+    }
+  }
+
+  if (target.localPath) {
+    const localFilePath = path.join(uploadsDir, target.localPath);
+    try {
+      if (fs.existsSync(localFilePath)) {
+        fs.unlinkSync(localFilePath);
+      }
+    } catch (err) {
+      console.warn(`Local file unlink warning for ${target.localPath}:`, err.message);
+    }
+  }
+}
+
+// Batch delete endpoint (saves API calls from multiple fast user deletions)
+app.post(
+  "/api/images/batch-delete",
+  asyncHandler(async (req, res) => {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length) {
+      return res.json({ success: true, deletedCount: 0 });
+    }
+
+    const currentList = getStoredImages();
+    const targetsToDelete = currentList.filter(
+      (item) => ids.includes(item.id) || ids.includes(item.public_id)
+    );
+
+    for (const target of targetsToDelete) {
+      await removeImageFromStorageAndDb(target);
+    }
+
+    const updatedList = currentList.filter(
+      (item) => !ids.includes(item.id) && !ids.includes(item.public_id)
+    );
+    saveStoredImages(updatedList);
+
+    return res.json({
+      success: true,
+      deletedCount: targetsToDelete.length,
+    });
+  })
+);
+
+// Single delete endpoint
+app.delete(
+  "/api/images/:id",
+  asyncHandler(async (req, res) => {
     const { id } = req.params;
     const currentList = getStoredImages();
     const targetImage = currentList.find(
@@ -264,28 +337,8 @@ app.delete("/api/images/:id", async (req, res) => {
       return res.status(404).json({ error: "Image not found in gallery" });
     }
 
-    // If on Cloudinary, destroy it
-    if (targetImage.public_id && isCloudinaryConfigured()) {
-      try {
-        await deleteFromCloudinary(targetImage.public_id);
-      } catch (err) {
-        console.warn("Cloudinary delete warning:", err.message);
-      }
-    }
+    await removeImageFromStorageAndDb(targetImage);
 
-    // If local file, unlink
-    if (targetImage.localPath) {
-      const localFilePath = path.join(uploadsDir, targetImage.localPath);
-      if (fs.existsSync(localFilePath)) {
-        try {
-          fs.unlinkSync(localFilePath);
-        } catch (e) {
-          console.warn("Local file unlink error:", e.message);
-        }
-      }
-    }
-
-    // Remove from DB
     const updatedList = currentList.filter(
       (item) => item.id !== targetImage.id && item.public_id !== targetImage.public_id
     );
@@ -297,12 +350,15 @@ app.delete("/api/images/:id", async (req, res) => {
       deletedId: targetImage.id,
       public_id: targetImage.public_id,
     });
-  } catch (error) {
-    console.error("Delete error:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to delete image",
-    });
-  }
+  })
+);
+
+// Central Express error handling middleware
+app.use((err, req, res, next) => {
+  console.error("API error:", err);
+  res.status(err.status || 500).json({
+    error: err.message || "Internal server error",
+  });
 });
 
 app.listen(PORT, async () => {

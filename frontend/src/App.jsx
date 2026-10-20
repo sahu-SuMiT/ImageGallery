@@ -19,14 +19,14 @@ function App() {
   const imagesRef = useRef([]);
   imagesRef.current = images;
 
-  // 0.5s upload debounce refs
-  const pendingUploadsRef = useRef([]);
+  // Debounce refs to save network API calls from fast user insertions/deletions
+  const pendingUploadItemsRef = useRef([]);
   const uploadDebounceTimerRef = useRef(null);
 
-  // 1.0s removal debounce refs
-  const removeDebounceTimersRef = useRef({});
+  const pendingDeleteIdsRef = useRef([]);
+  const deleteDebounceTimerRef = useRef(null);
 
-  // Fetch stored images on mount
+  // Fetch initial stored images on mount
   useEffect(() => {
     const fetchImages = async () => {
       try {
@@ -46,12 +46,15 @@ function App() {
     fetchImages();
   }, []);
 
-  // Upload batch to backend/Cloudinary
-  const uploadBatch = async (batch) => {
-    if (!batch.length) return;
+  // Send single debounced upload request for all fast insertions
+  const flushDebouncedUpload = async () => {
+    const itemsToUpload = [...pendingUploadItemsRef.current];
+    pendingUploadItemsRef.current = [];
+
+    if (!itemsToUpload.length) return;
 
     const formData = new FormData();
-    batch.forEach((item) => {
+    itemsToUpload.forEach((item) => {
       if (item.file) {
         formData.append("images", item.file, item.name);
       }
@@ -67,9 +70,10 @@ function App() {
         const result = await res.json();
         const serverImages = result.images || [];
 
+        // Replace temporary local blob URLs with permanent Cloudinary URLs
         setImages((current) => {
           let updated = [...current];
-          batch.forEach((localItem, index) => {
+          itemsToUpload.forEach((localItem, index) => {
             const serverImage = serverImages[index];
             const idx = updated.findIndex((img) => img.id === localItem.id);
             if (idx !== -1 && serverImage) {
@@ -83,11 +87,29 @@ function App() {
         });
       }
     } catch (err) {
-      console.error("Upload error:", err);
+      console.error("Debounced upload failed:", err);
     }
   };
 
-  // Add files with 0.5s debounce for storing
+  // Send single debounced delete request for all fast deletions
+  const flushDebouncedDelete = async () => {
+    const idsToDelete = [...pendingDeleteIdsRef.current];
+    pendingDeleteIdsRef.current = [];
+
+    if (!idsToDelete.length) return;
+
+    try {
+      await fetch(`${API_BASE}/images/batch-delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: idsToDelete }),
+      });
+    } catch (err) {
+      console.error("Debounced delete failed:", err);
+    }
+  };
+
+  // Fast user insertions: update UI instantly, debounce the API call by 0.5s
   const addFiles = useCallback((fileList) => {
     const newImages = Array.from(fileList || [])
       .filter((file) => file.type.startsWith("image/"))
@@ -95,24 +117,61 @@ function App() {
 
     if (!newImages.length) return;
 
-    // Show in UI immediately
+    // 1. Instant UI update (0ms lag)
     setImages((current) => [...current, ...newImages]);
     setSelectedId((current) => current || newImages[0].id);
 
-    // Queue for debounced upload
-    pendingUploadsRef.current.push(...newImages);
+    // 2. Debounce network API call by 0.5s to batch rapid insertions into 1 API call
+    pendingUploadItemsRef.current.push(...newImages);
 
-    // Debounce of 0.5 sec (500ms) for storing copied/added images
     if (uploadDebounceTimerRef.current) {
       clearTimeout(uploadDebounceTimerRef.current);
     }
 
     uploadDebounceTimerRef.current = setTimeout(() => {
-      const batchToUpload = [...pendingUploadsRef.current];
-      pendingUploadsRef.current = [];
-      uploadBatch(batchToUpload);
+      uploadDebounceTimerRef.current = null;
+      flushDebouncedUpload();
     }, 500);
   }, []);
+
+  // Fast user deletions: update UI instantly, debounce the API call by 1.0s
+  const removeImage = (id) => {
+    // 1. Instant UI update (0ms lag)
+    setImages((current) => {
+      const image = current.find((item) => item.id === id);
+      if (image && image.url?.startsWith("blob:")) {
+        URL.revokeObjectURL(image.url);
+      }
+      return current.filter((item) => item.id !== id);
+    });
+
+    setSelectedId((current) => (current === id ? null : current));
+
+    // If this image was pending upload in the 0.5s window, remove it to save the upload entirely!
+    const wasPendingUpload = pendingUploadItemsRef.current.some(
+      (item) => item.id === id
+    );
+    if (wasPendingUpload) {
+      pendingUploadItemsRef.current = pendingUploadItemsRef.current.filter(
+        (item) => item.id !== id
+      );
+      return;
+    }
+
+    // 2. Debounce network API call by 1.0s to batch rapid deletions into 1 API call
+    if (!pendingDeleteIdsRef.current.includes(id)) {
+      pendingDeleteIdsRef.current.push(id);
+    }
+
+    if (deleteDebounceTimerRef.current) {
+      clearTimeout(deleteDebounceTimerRef.current);
+    }
+
+    deleteDebounceTimerRef.current = setTimeout(() => {
+      deleteDebounceTimerRef.current = null;
+      flushDebouncedDelete();
+    }, 1000);
+  };
 
   // Clipboard paste listener
   useEffect(() => {
@@ -141,9 +200,9 @@ function App() {
       if (uploadDebounceTimerRef.current) {
         clearTimeout(uploadDebounceTimerRef.current);
       }
-      Object.values(removeDebounceTimersRef.current).forEach((t) =>
-        clearTimeout(t)
-      );
+      if (deleteDebounceTimerRef.current) {
+        clearTimeout(deleteDebounceTimerRef.current);
+      }
       imagesRef.current.forEach((image) => {
         if (image.url?.startsWith("blob:")) {
           URL.revokeObjectURL(image.url);
@@ -151,44 +210,6 @@ function App() {
       });
     };
   }, []);
-
-  // Remove image with 1.0s debounce
-  const removeImage = (id) => {
-    // If already scheduled for removal, prevent duplicate timers
-    if (removeDebounceTimersRef.current[id]) {
-      return;
-    }
-
-    // Cancel from pending upload queue if removed before 0.5s upload fired
-    pendingUploadsRef.current = pendingUploadsRef.current.filter(
-      (item) => item.id !== id
-    );
-
-    // 1.0s debounce before removing from UI and backend
-    removeDebounceTimersRef.current[id] = setTimeout(async () => {
-      delete removeDebounceTimersRef.current[id];
-
-      // Remove from UI
-      setImages((current) => {
-        const image = current.find((item) => item.id === id);
-        if (image && image.url?.startsWith("blob:")) {
-          URL.revokeObjectURL(image.url);
-        }
-        return current.filter((item) => item.id !== id);
-      });
-
-      setSelectedId((current) => (current === id ? null : current));
-
-      // Call backend DELETE
-      try {
-        await fetch(`${API_BASE}/images/${id}`, {
-          method: "DELETE",
-        });
-      } catch (err) {
-        console.error("Error deleting image:", err);
-      }
-    }, 1000);
-  };
 
   const selectedImage = images.find((image) => image.id === selectedId);
 
