@@ -1,5 +1,17 @@
 [
   {
+    "id": "1792494961871-1rhbt56",
+    "userId": "104042917591477955639",
+    "userEmail": "sumitsahu1304@gmail.com",
+    "name": "image.png",
+    "url": "https://res.cloudinary.com/rbgaa00k/image/upload/v1792494963/image_gallery/users/104042917591477955639/image_emu5vn.png",
+    "public_id": "image_gallery/users/104042917591477955639/image_emu5vn",
+    "format": "png",
+    "bytes": 288975,
+    "storage": "cloudinary",
+    "createdAt": "2026-10-20T11:16:04.307Z"
+  },
+  {
     "id": "1792492202747-9kgi9v2",
     "name": "image.png",
     "url": "https://res.cloudinary.com/rbgaa00k/image/upload/v1792492204/image_gallery/image_d00xqj.png",

@@ -6,6 +6,26 @@ const API_BASE = rawBackendUrl
   ? (rawBackendUrl.endsWith("/api") ? rawBackendUrl : `${rawBackendUrl}/api`)
   : "/api";
 
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() || "";
+
+// Utility to decode Google JWT token client-side without extra dependencies
+function parseJwt(token) {
+  try {
+    const base64Url = token.split(".")[1];
+    const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(jsonPayload);
+  } catch (err) {
+    console.error("JWT parse error:", err);
+    return {};
+  }
+}
+
 const createImage = (file) => ({
   id: `${file.name}-${file.lastModified}-${Math.random()}`,
   name: file.name || "Pasted image",
@@ -18,9 +38,23 @@ function App() {
   const [selectedId, setSelectedId] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
 
+  // User state
+  const [user, setUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem("gallery_google_user");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
   const inputRef = useRef(null);
   const imagesRef = useRef([]);
   imagesRef.current = images;
+
+  const googleBtnRef = useRef(null);
+  const userRef = useRef(user);
+  userRef.current = user;
 
   // Debounce refs to save network API calls from fast user insertions/deletions
   const pendingUploadItemsRef = useRef([]);
@@ -29,25 +63,117 @@ function App() {
   const pendingDeleteIdsRef = useRef([]);
   const deleteDebounceTimerRef = useRef(null);
 
-  // Fetch initial stored images on mount
+  // Initialize Google Identity Services
   useEffect(() => {
-    const fetchImages = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/images`);
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.images) && data.images.length > 0) {
-            setImages(data.images);
-            setSelectedId(data.images[0].id);
-          }
+    const initGoogleGsi = () => {
+      if (window.google?.accounts?.id && GOOGLE_CLIENT_ID && googleBtnRef.current) {
+        try {
+          window.google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID,
+            callback: (response) => {
+              if (response?.credential) {
+                const payload = parseJwt(response.credential);
+                const userData = {
+                  token: response.credential,
+                  id: payload.sub,
+                  name: payload.name || "Google User",
+                  email: payload.email,
+                  picture: payload.picture,
+                };
+                setUser(userData);
+                localStorage.setItem("gallery_google_user", JSON.stringify(userData));
+              }
+            },
+          });
+
+          window.google.accounts.id.renderButton(googleBtnRef.current, {
+            theme: "outline",
+            size: "medium",
+            type: "standard",
+            text: "signin_with",
+            shape: "rectangular",
+          });
+        } catch (err) {
+          console.warn("Google button render error:", err);
         }
-      } catch (err) {
-        console.warn("Could not load stored images:", err);
       }
     };
 
-    fetchImages();
+    if (!user) {
+      if (window.google) {
+        initGoogleGsi();
+      } else {
+        const interval = setInterval(() => {
+          if (window.google) {
+            clearInterval(interval);
+            initGoogleGsi();
+          }
+        }, 300);
+        return () => clearInterval(interval);
+      }
+    }
+  }, [user]);
+
+  // Fetch images for current authenticated user
+  const fetchImages = useCallback(async (authToken) => {
+    if (!authToken) {
+      setImages([]);
+      setSelectedId(null);
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/images`, {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.images)) {
+          setImages(data.images);
+          setSelectedId((curr) => curr || (data.images.length ? data.images[0].id : null));
+        }
+      } else if (res.status === 401) {
+        // Token expired
+        setUser(null);
+        localStorage.removeItem("gallery_google_user");
+      }
+    } catch (err) {
+      console.warn("Could not load user images:", err);
+    }
   }, []);
+
+  useEffect(() => {
+    if (user?.token) {
+      fetchImages(user.token);
+    } else {
+      setImages([]);
+      setSelectedId(null);
+    }
+  }, [user, fetchImages]);
+
+  // Demo sign-in for testing user isolation before setting up Google Cloud Console
+  const handleDemoSignIn = (demoName = "User 1") => {
+    const demoToken = `demo_user_${demoName.toLowerCase().replace(/\s+/g, "_")}`;
+    const userData = {
+      token: demoToken,
+      id: `demo_${demoName.toLowerCase().replace(/\s+/g, "_")}`,
+      name: demoName,
+      email: `${demoName.toLowerCase().replace(/\s+/g, "")}@example.com`,
+      picture: null,
+    };
+    setUser(userData);
+    localStorage.setItem("gallery_google_user", JSON.stringify(userData));
+  };
+
+  const handleSignOut = () => {
+    setUser(null);
+    localStorage.removeItem("gallery_google_user");
+    setImages([]);
+    setSelectedId(null);
+  };
 
   // Send single debounced upload request for all fast insertions
   const flushDebouncedUpload = async () => {
@@ -55,6 +181,8 @@ function App() {
     pendingUploadItemsRef.current = [];
 
     if (!itemsToUpload.length) return;
+    const currentUser = userRef.current;
+    if (!currentUser?.token) return;
 
     const formData = new FormData();
     itemsToUpload.forEach((item) => {
@@ -66,6 +194,9 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/images/upload`, {
         method: "POST",
+        headers: {
+          Authorization: `Bearer ${currentUser.token}`,
+        },
         body: formData,
       });
 
@@ -100,11 +231,16 @@ function App() {
     pendingDeleteIdsRef.current = [];
 
     if (!idsToDelete.length) return;
+    const currentUser = userRef.current;
+    if (!currentUser?.token) return;
 
     try {
       await fetch(`${API_BASE}/images/batch-delete`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${currentUser.token}`,
+        },
         body: JSON.stringify({ ids: idsToDelete }),
       });
     } catch (err) {
@@ -114,6 +250,11 @@ function App() {
 
   // Fast user insertions: update UI instantly, debounce the API call by 0.5s
   const addFiles = useCallback((fileList) => {
+    if (!userRef.current) {
+      alert("Please sign in with Google to save images to your account.");
+      return;
+    }
+
     const newImages = Array.from(fileList || [])
       .filter((file) => file.type.startsWith("image/"))
       .map(createImage);
@@ -229,12 +370,61 @@ function App() {
             </p>
           </div>
 
-          <span
-            className="shortcut-hint"
-            data-testid="paste-hint"
-          >
-            Ctrl + V to paste
-          </span>
+          <div className="header-right">
+            {user ? (
+              <div className="user-profile">
+                {user.picture && (
+                  <img
+                    src={user.picture}
+                    alt={user.name}
+                    className="user-avatar"
+                  />
+                )}
+                <span className="user-name" title={user.email}>
+                  {user.name}
+                </span>
+                <button
+                  type="button"
+                  className="signout-button"
+                  onClick={handleSignOut}
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <div className="auth-container">
+                {/* Official Google Sign-In Button */}
+                <div ref={googleBtnRef}></div>
+
+                {/* Instant Demo Switcher for fast local testing */}
+                {!GOOGLE_CLIENT_ID && (
+                  <>
+                    <button
+                      type="button"
+                      className="demo-login-btn"
+                      onClick={() => handleDemoSignIn("Sumit")}
+                    >
+                      Login as Sumit
+                    </button>
+                    <button
+                      type="button"
+                      className="demo-login-btn"
+                      onClick={() => handleDemoSignIn("Alex")}
+                    >
+                      Login as Alex
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            <span
+              className="shortcut-hint"
+              data-testid="paste-hint"
+            >
+              Ctrl + V to paste
+            </span>
+          </div>
         </header>
 
         <div
@@ -252,21 +442,29 @@ function App() {
           }}
           onDrop={(event) => {
             event.preventDefault();
-
             setIsDragging(false);
-
             addFiles(event.dataTransfer.files);
           }}
         >
           <strong>Drop images here</strong>
 
-          <span>or paste from your clipboard</span>
+          <span>
+            {user
+              ? "or paste from your clipboard"
+              : "Sign in with Google to save images to your account"}
+          </span>
 
           <button
             type="button"
             className="browse-button"
             data-testid="browse-images-button"
-            onClick={() => inputRef.current?.click()}
+            onClick={() => {
+              if (!user) {
+                alert("Please sign in with Google first.");
+                return;
+              }
+              inputRef.current?.click();
+            }}
           >
             Browse files
           </button>
@@ -360,7 +558,9 @@ function App() {
             className="empty-state"
             data-testid="empty-gallery-message"
           >
-            Your gallery is empty.
+            {user
+              ? "Your gallery is empty. Copy and paste an image to try it!"
+              : "Please sign in with Google above to view and save your images."}
           </p>
         )}
       </section>

@@ -71,7 +71,12 @@ CLOUDINARY_API_SECRET=${currentConfig.api_secret}
   return getConfigStatus();
 }
 
-export async function uploadToCloudinary(buffer, originalname, mimetype) {
+export async function uploadToCloudinary(
+  buffer,
+  originalname,
+  mimetype,
+  folder = "image_gallery"
+) {
   if (!isCloudinaryConfigured()) {
     throw new Error(
       "Cloudinary is not fully configured yet. Cloud Name and API Secret are required alongside API Key."
@@ -81,7 +86,7 @@ export async function uploadToCloudinary(buffer, originalname, mimetype) {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       {
-        folder: "image_gallery",
+        folder,
         resource_type: "image",
         filename_override: originalname,
         use_filename: true,

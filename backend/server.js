@@ -11,6 +11,7 @@ import {
   uploadToCloudinary,
   deleteFromCloudinary,
 } from "./cloudinaryConfig.js";
+import { authMiddleware } from "./authMiddleware.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,6 +81,14 @@ app.get("/api/config", (req, res) => {
   res.json(getConfigStatus());
 });
 
+// Verify current authenticated user
+app.get("/api/auth/me", authMiddleware, (req, res) => {
+  res.json({
+    success: true,
+    user: req.user,
+  });
+});
+
 // Synchronize any local fallback images to Cloudinary once credentials are active
 export async function syncLocalImagesToCloudinary() {
   if (!isCloudinaryConfigured()) {
@@ -110,7 +119,16 @@ export async function syncLocalImagesToCloudinary() {
           ? "image/webp"
           : "image/png";
 
-      const cloudResult = await uploadToCloudinary(buffer, img.name, mimetype);
+      const userFolder = img.userId
+        ? `image_gallery/users/${img.userId}`
+        : "image_gallery";
+
+      const cloudResult = await uploadToCloudinary(
+        buffer,
+        img.name,
+        mimetype,
+        userFolder
+      );
       img.url = cloudResult.secure_url || cloudResult.url;
       img.public_id = cloudResult.public_id;
       img.storage = "cloudinary";
@@ -169,21 +187,25 @@ app.post(
   })
 );
 
-// Get all stored gallery images
+// Get stored gallery images belonging to the authenticated user
 app.get(
   "/api/images",
+  authMiddleware,
   asyncHandler(async (req, res) => {
-    const images = getStoredImages();
+    const allImages = getStoredImages();
+    // Return strictly images created by this user
+    const userImages = allImages.filter((img) => img.userId === req.user.id);
     res.json({
       success: true,
-      images,
+      images: userImages,
     });
   })
 );
 
-// Upload image(s) to Cloudinary
+// Upload image(s) to Cloudinary for the authenticated user
 app.post(
   "/api/images/upload",
+  authMiddleware,
   upload.array("images", 20),
   asyncHandler(async (req, res) => {
     const files = req.files || [];
@@ -193,6 +215,7 @@ app.post(
 
     const isConfigured = isCloudinaryConfigured();
     const uploadedImages = [];
+    const userFolder = `image_gallery/users/${req.user.id}`;
 
     for (const file of files) {
       const imageId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -203,11 +226,14 @@ app.post(
           const cloudResult = await uploadToCloudinary(
             file.buffer,
             originalName,
-            file.mimetype
+            file.mimetype,
+            userFolder
           );
 
           uploadedImages.push({
             id: imageId,
+            userId: req.user.id,
+            userEmail: req.user.email,
             name: originalName,
             url: cloudResult.secure_url || cloudResult.url,
             public_id: cloudResult.public_id,
@@ -217,7 +243,10 @@ app.post(
             createdAt: new Date().toISOString(),
           });
         } catch (uploadErr) {
-          console.error(`Failed to upload ${originalName} to Cloudinary:`, uploadErr.message);
+          console.error(
+            `Failed to upload ${originalName} to Cloudinary:`,
+            uploadErr.message
+          );
 
           // Graceful fallback to local storage for this specific image
           const ext = path.extname(originalName) || ".png";
@@ -228,6 +257,8 @@ app.post(
           const localUrl = `http://localhost:${PORT}/uploads/${localFileName}`;
           uploadedImages.push({
             id: imageId,
+            userId: req.user.id,
+            userEmail: req.user.email,
             name: originalName,
             url: localUrl,
             public_id: null,
@@ -247,6 +278,8 @@ app.post(
         const localUrl = `http://localhost:${PORT}/uploads/${localFileName}`;
         uploadedImages.push({
           id: imageId,
+          userId: req.user.id,
+          userEmail: req.user.email,
           name: originalName,
           url: localUrl,
           public_id: null,
@@ -293,9 +326,10 @@ async function removeImageFromStorageAndDb(target) {
   }
 }
 
-// Batch delete endpoint (saves API calls from multiple fast user deletions)
+// Batch delete endpoint (only deletes images owned by the authenticated user)
 app.post(
   "/api/images/batch-delete",
+  authMiddleware,
   asyncHandler(async (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids) || !ids.length) {
@@ -303,8 +337,11 @@ app.post(
     }
 
     const currentList = getStoredImages();
+    // Only permit deleting images belonging to this user
     const targetsToDelete = currentList.filter(
-      (item) => ids.includes(item.id) || ids.includes(item.public_id)
+      (item) =>
+        (ids.includes(item.id) || ids.includes(item.public_id)) &&
+        (!item.userId || item.userId === req.user.id)
     );
 
     for (const target of targetsToDelete) {
@@ -312,7 +349,7 @@ app.post(
     }
 
     const updatedList = currentList.filter(
-      (item) => !ids.includes(item.id) && !ids.includes(item.public_id)
+      (item) => !targetsToDelete.some((t) => t.id === item.id)
     );
     saveStoredImages(updatedList);
 
@@ -323,9 +360,10 @@ app.post(
   })
 );
 
-// Single delete endpoint
+// Single delete endpoint (only deletes if owned by authenticated user)
 app.delete(
   "/api/images/:id",
+  authMiddleware,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
     const currentList = getStoredImages();
@@ -335,6 +373,11 @@ app.delete(
 
     if (!targetImage) {
       return res.status(404).json({ error: "Image not found in gallery" });
+    }
+
+    // Authorization check
+    if (targetImage.userId && targetImage.userId !== req.user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not own this image." });
     }
 
     await removeImageFromStorageAndDb(targetImage);
