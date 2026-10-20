@@ -70,10 +70,7 @@ app.use("/uploads", express.static(uploadsDir));
 
 // Health / Status endpoint
 app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    cloudinary: getConfigStatus(),
-  });
+  res.sendStatus(204);
 });
 
 // Get Cloudinary config status
@@ -116,8 +113,8 @@ export async function syncLocalImagesToCloudinary() {
         ext === ".jpg" || ext === ".jpeg"
           ? "image/jpeg"
           : ext === ".webp"
-          ? "image/webp"
-          : "image/png";
+            ? "image/webp"
+            : "image/png";
 
       const userFolder = img.userId
         ? `image_gallery/users/${img.userId}`
