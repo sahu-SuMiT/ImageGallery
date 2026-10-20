@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_BASE = "/api";
+const rawBackendUrl = (import.meta.env.VITE_BACKEND_URL || "").trim().replace(/\/+$/, "");
+const API_BASE = rawBackendUrl
+  ? (rawBackendUrl.endsWith("/api") ? rawBackendUrl : `${rawBackendUrl}/api`)
+  : "/api";
 
 const createImage = (file) => ({
   id: `${file.name}-${file.lastModified}-${Math.random()}`,
